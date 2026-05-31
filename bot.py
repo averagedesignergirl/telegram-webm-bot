@@ -2,9 +2,6 @@ import os
 import subprocess
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-import asyncio
-from threading import Thread
-from flask import Flask
 
 # ========================= CONFIG =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -41,9 +38,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", input_path,
-            "-t", "3",                    # First 3 seconds
+            "-t", "3",
             "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,fps=30",
-            "-an",                        # No audio
+            "-an",
             "-c:v", "libvpx-vp9",
             "-b:v", "150K",
             "-maxrate", "150K",
@@ -54,7 +51,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             output_path
         ]
 
-        result = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         if os.path.exists(output_path) and os.path.getsize(output_path) < 256 * 1024:
             await message.reply_document(
@@ -69,7 +66,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(f"❌ Error: {str(e)}")
     
     finally:
-        # Cleanup files
+        # Cleanup
         for path in (input_path, output_path):
             if os.path.exists(path):
                 try:
@@ -79,34 +76,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================= MAIN =======================
-def run_bot():
-    """Run the Telegram bot"""
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     
-    print("🤖 Bot is running...")
+    print("🤖 Telegram WebM Bot is starting...")
     app.run_polling(drop_pending_updates=True)
-
-
-def main():
-    # Start bot in background thread
-    bot_thread = Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
-    # Flask server to satisfy Render Web Service requirement
-    port = int(os.environ.get("PORT", 10000))
-    flask_app = Flask(__name__)
-
-    @flask_app.route('/')
-    def home():
-        return "✅ Telegram WebM Bot is running!"
-
-    @flask_app.route('/health')
-    def health():
-        return "OK", 200
-
-    print(f"🌐 Starting Flask server on port {port}")
-    flask_app.run(host='0.0.0.0', port=port)
 
 
 if __name__ == "__main__":
