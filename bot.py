@@ -2,6 +2,8 @@ import os
 import subprocess
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from flask import Flask
+from threading import Thread
 
 # ========================= CONFIG =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -14,7 +16,7 @@ OUTPUT_DIR = "outputs"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ======================= HANDLER =======================
+# ======================= TELEGRAM HANDLER =======================
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     video = message.video or (message.document if message.document and 
@@ -32,22 +34,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         output_path = os.path.join(OUTPUT_DIR, f"{video.file_id}.webm")
 
         await file.download_to_drive(input_path)
-
         await message.reply_text("⚙️ Converting to WebM sticker...")
 
         ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-t", "3",
+            "ffmpeg", "-y", "-i", input_path, "-t", "3",
             "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,fps=30",
-            "-an",
-            "-c:v", "libvpx-vp9",
-            "-b:v", "150K",
-            "-maxrate", "150K",
-            "-bufsize", "300K",
-            "-crf", "35",
-            "-deadline", "realtime",
-            "-cpu-used", "6",
+            "-an", "-c:v", "libvpx-vp9", "-b:v", "150K", "-maxrate", "150K",
+            "-bufsize", "300K", "-crf", "35", "-deadline", "realtime", "-cpu-used", "6",
             output_path
         ]
 
@@ -60,28 +53,45 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="✅ Here is your WebM sticker!"
             )
         else:
-            await message.reply_text("❌ Conversion failed or file is too big (>256KB).")
+            await message.reply_text("❌ Failed or file too big (>256KB).")
 
     except Exception as e:
         await message.reply_text(f"❌ Error: {str(e)}")
-    
     finally:
-        # Cleanup
-        for path in (input_path, output_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except:
-                    pass
+        for p in (input_path, output_path):
+            if os.path.exists(p):
+                try: os.remove(p)
+                except: pass
+
+
+# ======================= FLASK FOR RENDER =======================
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "✅ Telegram WebM Bot is running!"
+
+@flask_app.route('/health')
+def health():
+    return "OK", 200
 
 
 # ======================= MAIN =======================
-def main():
+def run_telegram_bot():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    
-    print("🤖 Telegram WebM Bot is starting...")
+    print("🤖 Telegram bot started...")
     app.run_polling(drop_pending_updates=True)
+
+
+def main():
+    # Start Telegram bot in background
+    Thread(target=run_telegram_bot, daemon=True).start()
+
+    # Start Flask server for Render
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 Starting web server on port {port}")
+    flask_app.run(host='0.0.0.0', port=port)
 
 
 if __name__ == "__main__":
