@@ -28,33 +28,42 @@ def health():
 # ======================= TELEGRAM BOT =======================
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    video = message.video or (message.document if message.document and 
-                            message.document.mime_type and 
-                            message.document.mime_type.startswith("video/") else None)
-   
+    video = None
+    
+    # Support video, GIF (animation), and video documents
+    if message.video:
+        video = message.video
+    elif message.animation:  # GIF support
+        video = message.animation
+    elif message.document and message.document.mime_type:
+        if (message.document.mime_type.startswith("video/") or 
+            message.document.mime_type == "image/gif"):
+            video = message.document
+
     if not video:
         return
 
     try:
         await message.reply_text("🔄 Downloading...")
         file = await context.bot.get_file(video.file_id)
-        
+       
         input_path = os.path.join(DOWNLOAD_DIR, f"{video.file_id}.mp4")
         output_path = os.path.join(OUTPUT_DIR, f"{video.file_id}.webm")
-        
+       
         await file.download_to_drive(input_path)
-        await message.reply_text("⚙️ Converting to WebM...")
-
+        
+        await message.reply_text("⚙️ Converting to WebM (first 3s)...")
+        
         ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", input_path, "-t", "3",
+            "ffmpeg", "-y", "-i", input_path, "-t", "3",  # Auto-trim to first 3 seconds
             "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=512:512,fps=30",
             "-an", "-c:v", "libvpx-vp9", "-b:v", "150K", "-maxrate", "150K",
             "-bufsize", "300K", "-crf", "35", "-deadline", "realtime", "-cpu-used", "6",
             output_path
         ]
-        
+       
         result = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
+       
         if os.path.exists(output_path) and os.path.getsize(output_path) < 256 * 1024:
             await message.reply_document(
                 document=open(output_path, "rb"),
@@ -63,7 +72,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await message.reply_text("❌ Failed or file too big (>256KB)")
-            
+           
     except Exception as e:
         await message.reply_text(f"❌ Error: {str(e)}")
     finally:
