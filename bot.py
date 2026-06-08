@@ -1,6 +1,7 @@
 import os
 import subprocess
 import logging
+import threading
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from flask import Flask
@@ -22,9 +23,9 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Telegram sticker limits
-MAX_SIZE_BYTES = 256 * 1024      # 256 KB
-MAX_DURATION_SEC = 3             # 3 seconds max
-TARGET_RESOLUTION = 512          # 512x512
+MAX_SIZE_BYTES = 256 * 1024  # 256 KB
+MAX_DURATION_SEC = 3         # 3 seconds max
+TARGET_RESOLUTION = 512      # 512x512
 
 # ======================= FLASK APP =======================
 flask_app = Flask(__name__)
@@ -38,7 +39,6 @@ def health():
     return "OK", 200
 
 # ======================= HELPERS =======================
-
 def get_video_duration(path: str) -> float:
     """Return video duration in seconds using ffprobe."""
     cmd = [
@@ -52,7 +52,6 @@ def get_video_duration(path: str) -> float:
         return float(result.stdout.decode().strip())
     except (ValueError, AttributeError):
         return 0.0
-
 
 def get_video_dimensions(path: str) -> tuple[int, int]:
     """Return (width, height) of the video using ffprobe."""
@@ -70,43 +69,36 @@ def get_video_dimensions(path: str) -> tuple[int, int]:
     except Exception:
         return 0, 0
 
-
 def build_scale_filter(width: int, height: int) -> str:
     """
     Build a vf filter chain that meets Telegram sticker requirements:
-    - Longer side = 512 px, shorter side <= 512 px (aspect preserved),
-      OR square crop → 512×512.
-    We use the square-crop approach (Telegram stickers are usually square).
+    - Square crop → 512×512, 30 fps
     """
-    # Square crop of the central region, then scale to 512×512
     return (
-        "crop=min(iw\\,ih):min(iw\\,ih),"   # square central crop
-        f"scale={TARGET_RESOLUTION}:{TARGET_RESOLUTION}:flags=lanczos,"  # 512×512
-        f"fps=30"                              # cap at 30 fps
+        "crop=min(iw\\,ih):min(iw\\,ih),"
+        f"scale={TARGET_RESOLUTION}:{TARGET_RESOLUTION}:flags=lanczos,"
+        "fps=30"
     )
-
 
 def convert_to_webm(input_path: str, output_path: str) -> bool:
     """
-    Convert video to a WebM/VP9 file that fits Telegram sticker requirements.
-    Uses a two-pass strategy: first tries quality-based encode,
-    then falls back to lower bitrate if the file is still too big.
-    Returns True on success, False on failure.
+    Convert video to WebM/VP9 sticker.
+    Uses two-pass strategy. Returns True if final file <= 256 KB.
     """
     duration = min(get_video_duration(input_path), MAX_DURATION_SEC)
     width, height = get_video_dimensions(input_path)
     vf = build_scale_filter(width, height)
 
-    # --- Pass 1: CRF-based encode (good quality, usually small) ---
+    # --- Pass 1: CRF-based encode ---
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
         "-t", str(duration),
         "-vf", vf,
-        "-an",                          # no audio
+        "-an",
         "-c:v", "libvpx-vp9",
-        "-crf", "33",                   # quality-based (lower = better quality)
-        "-b:v", "0",                    # pure CRF mode (b:v=0 required for vp9 CRF)
+        "-crf", "33",
+        "-b:v", "0",
         "-deadline", "good",
         "-cpu-used", "3",
         output_path
@@ -120,11 +112,10 @@ def convert_to_webm(input_path: str, output_path: str) -> bool:
         if size <= MAX_SIZE_BYTES:
             return True
 
-    # --- Pass 2: constrained bitrate encode if still too big ---
+    # --- Pass 2: constrained bitrate if still too big ---
     logger.info("File too large, switching to constrained bitrate encode")
-    # Safe target: leave 10 % headroom
     target_kbps = int((MAX_SIZE_BYTES * 8 * 0.9) / (duration * 1000))
-    target_kbps = max(target_kbps, 50)   # floor at 50 Kbps
+    target_kbps = max(target_kbps, 50)
 
     cmd2 = [
         "ffmpeg", "-y",
@@ -147,17 +138,13 @@ def convert_to_webm(input_path: str, output_path: str) -> bool:
         size2 = os.path.getsize(output_path)
         logger.info("Pass-2 output size: %d bytes", size2)
         return size2 <= MAX_SIZE_BYTES
-
     return False
 
-
 # ======================= TELEGRAM BOT =======================
-
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     video = None
 
-    # Accept: video, animation (GIF), and video/gif documents
     if message.video:
         video = message.video
     elif message.animation:
@@ -201,11 +188,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Не удалось уложиться в 256 КБ.\n"
                 "Попробуй видео покороче или с меньшим движением."
             )
-
     except Exception as e:
         logger.exception("Error processing video")
         await message.reply_text(f"❌ Ошибка: {e}")
-
     finally:
         for path in (input_path, output_path):
             if os.path.exists(path):
@@ -213,7 +198,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     os.remove(path)
                 except OSError:
                     pass
-
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -226,9 +210,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• кодек VP9"
     )
 
-
 # ======================= APP FACTORY =======================
-
 def create_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(
@@ -242,10 +224,20 @@ def create_app() -> Application:
     )
     return app
 
+# ======================= RUN FLASK + BOT =======================
+def run_flask():
+    """Start Flask so Render can reach /health and $PORT."""
+    port = int(os.environ.get("PORT", 5000))
+    logger.info("Starting Flask on 0.0.0.0:%d", port)
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ======================= MAIN =======================
-
 if __name__ == "__main__":
     bot_app = create_app()
-    print("🤖 Starting bot (polling mode)")
+
+    # Start Flask in background thread (daemon)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    print("🤖 Starting bot (polling mode) + Flask health server")
     bot_app.run_polling()
