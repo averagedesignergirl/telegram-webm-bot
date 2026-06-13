@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import logging
 import threading
@@ -22,10 +23,10 @@ OUTPUT_DIR = "outputs"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Telegram sticker limits
-MAX_SIZE_BYTES = 256 * 1024  # 256 KB
-MAX_DURATION_SEC = 3         # 3 seconds max
-TARGET_RESOLUTION = 512      # 512x512
+MAX_SIZE_BYTES = 256 * 1024
+MAX_DURATION_SEC = 3
+TARGET_RESOLUTION = 512
+MAX_INPUT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB guard
 
 # ======================= FLASK APP =======================
 flask_app = Flask(__name__)
@@ -40,7 +41,6 @@ def health():
 
 # ======================= HELPERS =======================
 def get_video_duration(path: str) -> float:
-    """Return video duration in seconds using ffprobe."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -50,11 +50,11 @@ def get_video_duration(path: str) -> float:
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         return float(result.stdout.decode().strip())
-    except (ValueError, AttributeError):
+    except ValueError:
         return 0.0
 
+
 def get_video_dimensions(path: str) -> tuple[int, int]:
-    """Return (width, height) of the video using ffprobe."""
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -66,60 +66,87 @@ def get_video_dimensions(path: str) -> tuple[int, int]:
     try:
         w, h = result.stdout.decode().strip().split(",")
         return int(w), int(h)
-    except Exception:
+    except (ValueError, AttributeError):
         return 0, 0
 
-def build_scale_filter(width: int, height: int) -> str:
-    """
-    Build a vf filter chain that meets Telegram sticker requirements:
-    - Square crop → 512×512, 30 fps
-    """
-    return (
-        "crop=min(iw\\,ih):min(iw\\,ih),"
-        f"scale={TARGET_RESOLUTION}:{TARGET_RESOLUTION}:flags=lanczos,"
-        "fps=30"
-    )
 
-def convert_to_webm(input_path: str, output_path: str) -> bool:
+def calc_scaled_dimensions(width: int, height: int) -> tuple[int, int]:
     """
-    Convert video to WebM/VP9 sticker.
-    Uses two-pass strategy. Returns True if final file <= 256 KB.
+    Scale so that the long side = 512 px, preserving aspect ratio.
+    Both dimensions are rounded to the nearest even number (VP9 requirement).
     """
-    duration = min(get_video_duration(input_path), MAX_DURATION_SEC)
-    width, height = get_video_dimensions(input_path)
-    vf = build_scale_filter(width, height)
+    if width >= height:
+        # Landscape or square
+        new_width = TARGET_RESOLUTION
+        new_height = round(height * TARGET_RESOLUTION / width)
+    else:
+        # Portrait
+        new_height = TARGET_RESOLUTION
+        new_width = round(width * TARGET_RESOLUTION / height)
 
-    # --- Pass 1: CRF-based encode ---
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_path,
+    # Round to nearest even (VP9 requires even dimensions)
+    # Round UP to even so we never go below the calculated size
+    if new_width % 2 != 0:
+        new_width += 1
+    if new_height % 2 != 0:
+        new_height += 1
+
+    # Clamp to TARGET_RESOLUTION in case rounding pushed us over
+    new_width = min(new_width, TARGET_RESOLUTION)
+    new_height = min(new_height, TARGET_RESOLUTION)
+
+    return new_width, new_height
+
+
+def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
+    """
+    Convert video to WebM VP9 sticker format.
+
+    Returns:
+        (success, was_trimmed) — was_trimmed is True when the source was
+        longer than MAX_DURATION_SEC and got cut.
+    """
+    actual_duration = get_video_duration(input_path)
+    was_trimmed = actual_duration > MAX_DURATION_SEC
+    duration = min(actual_duration, MAX_DURATION_SEC)
+
+    w, h = get_video_dimensions(input_path)
+    if w == 0 or h == 0:
+        logger.error("Could not read video dimensions from %s", input_path)
+        return False, was_trimmed
+
+    new_w, new_h = calc_scaled_dimensions(w, h)
+    vf = f"scale={new_w}:{new_h}:flags=lanczos,fps=30"
+    logger.info("VIDEO FILTER: scale=%d:%d (source %dx%d)", new_w, new_h, w, h)
+
+    # --- Pass 1: CRF (quality-based) ---
+    cmd1 = [
+        "ffmpeg", "-y", "-i", input_path,
         "-t", str(duration),
         "-vf", vf,
         "-an",
         "-c:v", "libvpx-vp9",
-        "-crf", "33",
-        "-b:v", "0",
-        "-deadline", "good",
-        "-cpu-used", "3",
+        "-crf", "33", "-b:v", "0",
+        "-deadline", "good", "-cpu-used", "3",
         output_path
     ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    logger.info("ffmpeg pass-1 stderr: %s", result.stderr.decode()[-800:])
+    result1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    if os.path.exists(output_path):
-        size = os.path.getsize(output_path)
-        logger.info("Pass-1 output size: %d bytes", size)
-        if size <= MAX_SIZE_BYTES:
-            return True
+    if result1.returncode == 0 and os.path.exists(output_path):
+        if os.path.getsize(output_path) <= MAX_SIZE_BYTES:
+            logger.info("SUCCESS on pass 1 (CRF)")
+            return True, was_trimmed
+        logger.info(
+            "Pass 1 output too large (%d bytes), falling back to pass 2",
+            os.path.getsize(output_path)
+        )
+    else:
+        logger.warning("Pass 1 ffmpeg failed: %s", result1.stderr.decode())
 
-    # --- Pass 2: constrained bitrate if still too big ---
-    logger.info("File too large, switching to constrained bitrate encode")
-    target_kbps = int((MAX_SIZE_BYTES * 8 * 0.9) / (duration * 1000))
-    target_kbps = max(target_kbps, 50)
-
+    # --- Pass 2: Fixed bitrate ---
+    target_kbps = max(int((MAX_SIZE_BYTES * 8 * 0.9) / (duration * 1000)), 50)
     cmd2 = [
-        "ffmpeg", "-y",
-        "-i", input_path,
+        "ffmpeg", "-y", "-i", input_path,
         "-t", str(duration),
         "-vf", vf,
         "-an",
@@ -127,34 +154,56 @@ def convert_to_webm(input_path: str, output_path: str) -> bool:
         "-b:v", f"{target_kbps}k",
         "-maxrate", f"{target_kbps}k",
         "-bufsize", f"{target_kbps * 2}k",
-        "-deadline", "good",
-        "-cpu-used", "4",
+        "-deadline", "good", "-cpu-used", "4",
         output_path
     ]
     result2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    logger.info("ffmpeg pass-2 stderr: %s", result2.stderr.decode()[-800:])
 
-    if os.path.exists(output_path):
-        size2 = os.path.getsize(output_path)
-        logger.info("Pass-2 output size: %d bytes", size2)
-        return size2 <= MAX_SIZE_BYTES
-    return False
+    if result2.returncode != 0:
+        logger.warning("Pass 2 ffmpeg failed: %s", result2.stderr.decode())
 
-# ======================= TELEGRAM BOT =======================
+    success = (
+        os.path.exists(output_path)
+        and os.path.getsize(output_path) <= MAX_SIZE_BYTES
+    )
+    if success:
+        logger.info("SUCCESS on pass 2 (%dk bitrate)", target_kbps)
+    else:
+        logger.warning("FAILED both passes")
+
+    return success, was_trimmed
+
+
+# ======================= TELEGRAM HANDLERS =======================
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    video = None
 
-    if message.video:
-        video = message.video
-    elif message.animation:
-        video = message.animation
-    elif message.document and message.document.mime_type:
-        mime = message.document.mime_type
-        if mime.startswith("video/") or mime == "image/gif":
-            video = message.document
+    # Resolve the media object (video, animation, or video/gif document)
+    video = (
+        message.video
+        or message.animation
+        or (
+            message.document
+            if message.document
+            and message.document.mime_type
+            and (
+                message.document.mime_type.startswith("video/")
+                or message.document.mime_type == "image/gif"
+            )
+            else None
+        )
+    )
 
     if not video:
+        return
+
+    # Guard against excessively large files before downloading
+    file_size = getattr(video, "file_size", None)
+    if file_size and file_size > MAX_INPUT_SIZE_BYTES:
+        await message.reply_text(
+            f"❌ Файл слишком большой ({file_size / 1024 / 1024:.1f} МБ). "
+            "Максимум — 50 МБ."
+        )
         return
 
     file_id = video.file_id
@@ -166,78 +215,96 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(file_id)
         await tg_file.download_to_drive(input_path)
 
-        await message.reply_text(
-            "⚙️ Конвертирую в WebM 512×512, до 3 с, без звука..."
-        )
+        w, h = get_video_dimensions(input_path)
+        if w == 0 or h == 0:
+            await message.reply_text("❌ Не удалось определить размеры видео.")
+            return
 
-        success = convert_to_webm(input_path, output_path)
+        new_w, new_h = calc_scaled_dimensions(w, h)
+        await message.reply_text(f"⚙️ Конвертирую в WebM ({new_w}x{new_h})...")
+
+        success, was_trimmed = convert_to_webm(input_path, output_path)
 
         if success:
             size_kb = os.path.getsize(output_path) / 1024
+            trim_note = "\n✂️ Видео обрезано до 3 сек." if was_trimmed else ""
             with open(output_path, "rb") as f:
                 await message.reply_document(
                     document=f,
                     filename="sticker.webm",
                     caption=(
-                        f"✅ Готово! Размер: {size_kb:.1f} КБ\n"
-                        "Формат: WebM VP9 • 512×512 • ≤3 с • без звука"
+                        f"✅ Готово! {size_kb:.1f} КБ\n"
+                        f"WebM VP9 • {new_w}x{new_h} • до 3с • без звука"
+                        f"{trim_note}"
                     )
                 )
         else:
             await message.reply_text(
-                "❌ Не удалось уложиться в 256 КБ.\n"
-                "Попробуй видео покороче или с меньшим движением."
+                "❌ Не удалось уложиться в 256 КБ. "
+                "Попробуй отправить более короткое видео."
             )
-    except Exception as e:
-        logger.exception("Error processing video")
-        await message.reply_text(f"❌ Ошибка: {e}")
+
+    except Exception:
+        logger.exception("Unhandled error in handle_video")
+        await message.reply_text("❌ Произошла ошибка при обработке видео.")
+
     finally:
-        for path in (input_path, output_path):
-            if os.path.exists(path):
+        for p in (input_path, output_path):
+            if os.path.exists(p):
                 try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                    os.remove(p)
+                except OSError as e:
+                    logger.warning("Could not delete temp file %s: %s", p, e)
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Отправь мне видео или GIF, и я конвертирую его "
-        "в WebM-стикер для Telegram:\n\n"
-        "• 512×512 пикселей\n"
-        "• до 3 секунд\n"
-        "• без звука\n"
-        "• до 256 КБ\n"
-        "• кодек VP9"
+        "👋 Отправь видео или GIF\n\n"
+        "Я сделаю стикер:\n"
+        "• Длинная сторона = 512 px\n"
+        "• Короткая сторона сохраняет пропорции (≤ 512)\n"
+        "• до 3 сек • без звука • до 256 КБ"
     )
+
 
 # ======================= APP FACTORY =======================
 def create_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(
-        MessageHandler(
-            filters.VIDEO | filters.ANIMATION | filters.Document.VIDEO,
-            handle_video
-        )
-    )
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
-    )
+
+    # FIX: added filters.Document.IMAGE so image/gif documents are handled
+    app.add_handler(MessageHandler(
+        filters.VIDEO
+        | filters.ANIMATION
+        | filters.Document.VIDEO
+        | filters.Document.IMAGE,
+        handle_video
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text
+    ))
     return app
 
-# ======================= RUN FLASK + BOT =======================
+
 def run_flask():
-    """Start Flask so Render can reach /health and $PORT."""
     port = int(os.environ.get("PORT", 5000))
-    logger.info("Starting Flask on 0.0.0.0:%d", port)
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ======================= MAIN =======================
+
+# ======================= ENTRY POINT =======================
 if __name__ == "__main__":
     bot_app = create_app()
 
-    # Start Flask in background thread (daemon)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    print("🤖 Starting bot (polling mode) + Flask health server")
+    # Graceful shutdown on SIGINT / SIGTERM
+    def _shutdown(signum, frame):
+        logger.info("Received signal %d, shutting down...", signum)
+        bot_app.stop_running()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    logger.info("🤖 Bot started (polling + Flask on port %s)", os.environ.get("PORT", 5000))
     bot_app.run_polling()
