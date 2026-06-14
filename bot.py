@@ -2,6 +2,7 @@ import os
 import subprocess
 import logging
 import asyncio
+import threading
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from flask import Flask, request, jsonify
@@ -17,19 +18,17 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set!")
 
-# Render.com automatically sets RENDER_EXTERNAL_URL, e.g. https://yourapp.onrender.com
-# You can also set WEBHOOK_URL manually if deploying elsewhere
+# Render sets RENDER_EXTERNAL_URL automatically; fallback to manual WEBHOOK_URL
 WEBHOOK_URL = (
     os.environ.get("WEBHOOK_URL")
-    or os.environ.get("RENDER_EXTERNAL_URL")
-)
+    or os.environ.get("RENDER_EXTERNAL_URL", "")
+).rstrip("/")
+
 if not WEBHOOK_URL:
     raise RuntimeError(
         "Could not determine webhook URL. "
-        "Set WEBHOOK_URL or deploy on Render (RENDER_EXTERNAL_URL is set automatically)."
+        "Set WEBHOOK_URL or deploy on Render (RENDER_EXTERNAL_URL is auto-set)."
     )
-# Strip trailing slash just in case
-WEBHOOK_URL = WEBHOOK_URL.rstrip("/")
 
 DOWNLOAD_DIR = "downloads"
 OUTPUT_DIR = "outputs"
@@ -39,13 +38,23 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_SIZE_BYTES = 256 * 1024
 MAX_DURATION_SEC = 3
 TARGET_RESOLUTION = 512
-MAX_INPUT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB guard
+MAX_INPUT_SIZE_BYTES = 50 * 1024 * 1024
 
-# ======================= FLASK APP =======================
+# ========================= ASYNC LOOP =========================
+# One persistent event loop running in a background thread.
+# Flask webhook handler submits coroutines into it via asyncio.run_coroutine_threadsafe.
+_loop = asyncio.new_event_loop()
+
+def _start_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+_loop_thread = threading.Thread(target=_start_loop, args=(_loop,), daemon=True)
+_loop_thread.start()
+
+# ========================= FLASK APP =========================
 flask_app = Flask(__name__)
-
-# Initialized once at startup
-bot_app: Application = None
+bot_app: Application = None  # set during init below
 
 @flask_app.route("/")
 def home():
@@ -57,20 +66,17 @@ def health():
 
 @flask_app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    """Receive updates from Telegram and dispatch to the bot."""
     data = request.get_json(force=True)
     if data and bot_app:
         update = Update.de_json(data, bot_app.bot)
-        # Create a new event loop per request (gunicorn/sync workers)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(bot_app.process_update(update))
-        finally:
-            loop.close()
+        # Submit to the persistent loop and wait for completion
+        future = asyncio.run_coroutine_threadsafe(
+            bot_app.process_update(update), _loop
+        )
+        future.result(timeout=60)  # block until handled; raises on exception
     return jsonify({"ok": True})
 
-# ======================= HELPERS =======================
+# ========================= HELPERS =========================
 def get_video_duration(path: str) -> float:
     cmd = [
         "ffprobe", "-v", "error",
@@ -102,10 +108,6 @@ def get_video_dimensions(path: str) -> tuple[int, int]:
 
 
 def calc_scaled_dimensions(width: int, height: int) -> tuple[int, int]:
-    """
-    Scale so that the long side = 512 px, preserving aspect ratio.
-    Both dimensions rounded to nearest even number (VP9 requirement).
-    """
     if width >= height:
         new_width = TARGET_RESOLUTION
         new_height = round(height * TARGET_RESOLUTION / width)
@@ -125,7 +127,6 @@ def calc_scaled_dimensions(width: int, height: int) -> tuple[int, int]:
 
 
 def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
-    """Returns (success, was_trimmed)."""
     actual_duration = get_video_duration(input_path)
     was_trimmed = actual_duration > MAX_DURATION_SEC
     duration = min(actual_duration, MAX_DURATION_SEC)
@@ -139,14 +140,11 @@ def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
     vf = f"scale={new_w}:{new_h}:flags=lanczos,fps=30"
     logger.info("VIDEO FILTER: scale=%d:%d (source %dx%d)", new_w, new_h, w, h)
 
-    # --- Pass 1: CRF ---
+    # Pass 1: CRF
     cmd1 = [
         "ffmpeg", "-y", "-i", input_path,
-        "-t", str(duration),
-        "-vf", vf,
-        "-an",
-        "-c:v", "libvpx-vp9",
-        "-crf", "33", "-b:v", "0",
+        "-t", str(duration), "-vf", vf, "-an",
+        "-c:v", "libvpx-vp9", "-crf", "33", "-b:v", "0",
         "-deadline", "good", "-cpu-used", "3",
         output_path
     ]
@@ -156,20 +154,15 @@ def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
         if os.path.getsize(output_path) <= MAX_SIZE_BYTES:
             logger.info("SUCCESS on pass 1 (CRF)")
             return True, was_trimmed
-        logger.info(
-            "Pass 1 output too large (%d bytes), falling back to pass 2",
-            os.path.getsize(output_path)
-        )
+        logger.info("Pass 1 too large (%d bytes), trying pass 2", os.path.getsize(output_path))
     else:
-        logger.warning("Pass 1 ffmpeg failed: %s", result1.stderr.decode())
+        logger.warning("Pass 1 failed: %s", result1.stderr.decode())
 
-    # --- Pass 2: Fixed bitrate ---
+    # Pass 2: Fixed bitrate
     target_kbps = max(int((MAX_SIZE_BYTES * 8 * 0.9) / (duration * 1000)), 50)
     cmd2 = [
         "ffmpeg", "-y", "-i", input_path,
-        "-t", str(duration),
-        "-vf", vf,
-        "-an",
+        "-t", str(duration), "-vf", vf, "-an",
         "-c:v", "libvpx-vp9",
         "-b:v", f"{target_kbps}k",
         "-maxrate", f"{target_kbps}k",
@@ -180,12 +173,9 @@ def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
     result2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     if result2.returncode != 0:
-        logger.warning("Pass 2 ffmpeg failed: %s", result2.stderr.decode())
+        logger.warning("Pass 2 failed: %s", result2.stderr.decode())
 
-    success = (
-        os.path.exists(output_path)
-        and os.path.getsize(output_path) <= MAX_SIZE_BYTES
-    )
+    success = os.path.exists(output_path) and os.path.getsize(output_path) <= MAX_SIZE_BYTES
     if success:
         logger.info("SUCCESS on pass 2 (%dk bitrate)", target_kbps)
     else:
@@ -194,7 +184,7 @@ def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
     return success, was_trimmed
 
 
-# ======================= TELEGRAM HANDLERS =======================
+# ====================== TELEGRAM HANDLERS ======================
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
@@ -219,8 +209,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_size = getattr(video, "file_size", None)
     if file_size and file_size > MAX_INPUT_SIZE_BYTES:
         await message.reply_text(
-            f"❌ Файл слишком большой ({file_size / 1024 / 1024:.1f} МБ). "
-            "Максимум — 50 МБ."
+            f"❌ Файл слишком большой ({file_size / 1024 / 1024:.1f} МБ). Максимум — 50 МБ."
         )
         return
 
@@ -258,8 +247,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         else:
             await message.reply_text(
-                "❌ Не удалось уложиться в 256 КБ. "
-                "Попробуй отправить более короткое видео."
+                "❌ Не удалось уложиться в 256 КБ. Попробуй более короткое видео."
             )
 
     except Exception:
@@ -285,40 +273,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ======================= BOT SETUP =======================
-async def setup_webhook(application: Application):
-    webhook_endpoint = f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}"
-    await application.bot.set_webhook(url=webhook_endpoint)
-    logger.info("Webhook registered: %s", webhook_endpoint)
-
-
-def create_bot_app() -> Application:
+# ====================== BOT INIT (at import time) ======================
+async def _init_bot() -> Application:
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(MessageHandler(
-        filters.VIDEO
-        | filters.ANIMATION
-        | filters.Document.VIDEO
-        | filters.Document.IMAGE,
+        filters.VIDEO | filters.ANIMATION | filters.Document.VIDEO | filters.Document.IMAGE,
         handle_video
     ))
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         handle_text
     ))
+    await application.initialize()
+    webhook_endpoint = f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}"
+    await application.bot.set_webhook(url=webhook_endpoint)
+    logger.info("Webhook registered: %s", webhook_endpoint)
     return application
 
-
-# ======================= STARTUP =======================
-# This runs at import time so gunicorn workers initialize the bot correctly
-bot_app = create_bot_app()
-loop = asyncio.new_event_loop()
-loop.run_until_complete(bot_app.initialize())
-loop.run_until_complete(setup_webhook(bot_app))
-loop.close()
-logger.info("🤖 Bot initialized in webhook mode. URL: %s", WEBHOOK_URL)
+# Block until the bot is fully initialized inside the persistent loop
+_init_future = asyncio.run_coroutine_threadsafe(_init_bot(), _loop)
+bot_app = _init_future.result(timeout=30)
+logger.info("🤖 Bot ready. Webhook URL: %s", WEBHOOK_URL)
 
 
-# ======================= ENTRY POINT (local dev) =======================
+# ====================== ENTRY POINT (local dev) ======================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
