@@ -17,9 +17,19 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set!")
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://yourapp.onrender.com
+# Render.com automatically sets RENDER_EXTERNAL_URL, e.g. https://yourapp.onrender.com
+# You can also set WEBHOOK_URL manually if deploying elsewhere
+WEBHOOK_URL = (
+    os.environ.get("WEBHOOK_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+)
 if not WEBHOOK_URL:
-    raise RuntimeError("WEBHOOK_URL environment variable is not set!")
+    raise RuntimeError(
+        "Could not determine webhook URL. "
+        "Set WEBHOOK_URL or deploy on Render (RENDER_EXTERNAL_URL is set automatically)."
+    )
+# Strip trailing slash just in case
+WEBHOOK_URL = WEBHOOK_URL.rstrip("/")
 
 DOWNLOAD_DIR = "downloads"
 OUTPUT_DIR = "outputs"
@@ -34,7 +44,7 @@ MAX_INPUT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB guard
 # ======================= FLASK APP =======================
 flask_app = Flask(__name__)
 
-# Set after bot is initialized
+# Initialized once at startup
 bot_app: Application = None
 
 @flask_app.route("/")
@@ -47,11 +57,17 @@ def health():
 
 @flask_app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    """Receive updates from Telegram and dispatch them to the bot."""
+    """Receive updates from Telegram and dispatch to the bot."""
     data = request.get_json(force=True)
     if data and bot_app:
         update = Update.de_json(data, bot_app.bot)
-        asyncio.run(bot_app.process_update(update))
+        # Create a new event loop per request (gunicorn/sync workers)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(bot_app.process_update(update))
+        finally:
+            loop.close()
     return jsonify({"ok": True})
 
 # ======================= HELPERS =======================
@@ -269,12 +285,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ======================= APP FACTORY =======================
+# ======================= BOT SETUP =======================
 async def setup_webhook(application: Application):
-    """Register the webhook URL with Telegram."""
     webhook_endpoint = f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}"
     await application.bot.set_webhook(url=webhook_endpoint)
-    logger.info("Webhook set to: %s", webhook_endpoint)
+    logger.info("Webhook registered: %s", webhook_endpoint)
 
 
 def create_bot_app() -> Application:
@@ -293,18 +308,17 @@ def create_bot_app() -> Application:
     return application
 
 
-# ======================= ENTRY POINT =======================
+# ======================= STARTUP =======================
+# This runs at import time so gunicorn workers initialize the bot correctly
+bot_app = create_bot_app()
+loop = asyncio.new_event_loop()
+loop.run_until_complete(bot_app.initialize())
+loop.run_until_complete(setup_webhook(bot_app))
+loop.close()
+logger.info("🤖 Bot initialized in webhook mode. URL: %s", WEBHOOK_URL)
+
+
+# ======================= ENTRY POINT (local dev) =======================
 if __name__ == "__main__":
-    import uvicorn
-    from asgiref.wsgi import WsgiToAsgi
-
-    bot_app = create_bot_app()
-
-    asyncio.run(bot_app.initialize())
-    asyncio.run(setup_webhook(bot_app))
-
-    logger.info("🤖 Bot started (webhook mode) on %s", WEBHOOK_URL)
-
     port = int(os.environ.get("PORT", 5000))
-    asgi_app = WsgiToAsgi(flask_app)
-    uvicorn.run(asgi_app, host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
