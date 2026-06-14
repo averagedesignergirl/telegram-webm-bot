@@ -1,11 +1,10 @@
 import os
-import signal
 import subprocess
 import logging
-import threading
+import asyncio
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from flask import Flask
+from flask import Flask, request, jsonify
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -17,6 +16,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is not set!")
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://yourapp.onrender.com
+if not WEBHOOK_URL:
+    raise RuntimeError("WEBHOOK_URL environment variable is not set!")
 
 DOWNLOAD_DIR = "downloads"
 OUTPUT_DIR = "outputs"
@@ -31,6 +34,9 @@ MAX_INPUT_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB guard
 # ======================= FLASK APP =======================
 flask_app = Flask(__name__)
 
+# Set after bot is initialized
+bot_app: Application = None
+
 @flask_app.route("/")
 def home():
     return "✅ Telegram WebM Sticker Bot is running!"
@@ -38,6 +44,15 @@ def home():
 @flask_app.route("/health")
 def health():
     return "OK", 200
+
+@flask_app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    """Receive updates from Telegram and dispatch them to the bot."""
+    data = request.get_json(force=True)
+    if data and bot_app:
+        update = Update.de_json(data, bot_app.bot)
+        asyncio.run(bot_app.process_update(update))
+    return jsonify({"ok": True})
 
 # ======================= HELPERS =======================
 def get_video_duration(path: str) -> float:
@@ -73,25 +88,20 @@ def get_video_dimensions(path: str) -> tuple[int, int]:
 def calc_scaled_dimensions(width: int, height: int) -> tuple[int, int]:
     """
     Scale so that the long side = 512 px, preserving aspect ratio.
-    Both dimensions are rounded to the nearest even number (VP9 requirement).
+    Both dimensions rounded to nearest even number (VP9 requirement).
     """
     if width >= height:
-        # Landscape or square
         new_width = TARGET_RESOLUTION
         new_height = round(height * TARGET_RESOLUTION / width)
     else:
-        # Portrait
         new_height = TARGET_RESOLUTION
         new_width = round(width * TARGET_RESOLUTION / height)
 
-    # Round to nearest even (VP9 requires even dimensions)
-    # Round UP to even so we never go below the calculated size
     if new_width % 2 != 0:
         new_width += 1
     if new_height % 2 != 0:
         new_height += 1
 
-    # Clamp to TARGET_RESOLUTION in case rounding pushed us over
     new_width = min(new_width, TARGET_RESOLUTION)
     new_height = min(new_height, TARGET_RESOLUTION)
 
@@ -99,13 +109,7 @@ def calc_scaled_dimensions(width: int, height: int) -> tuple[int, int]:
 
 
 def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
-    """
-    Convert video to WebM VP9 sticker format.
-
-    Returns:
-        (success, was_trimmed) — was_trimmed is True when the source was
-        longer than MAX_DURATION_SEC and got cut.
-    """
+    """Returns (success, was_trimmed)."""
     actual_duration = get_video_duration(input_path)
     was_trimmed = actual_duration > MAX_DURATION_SEC
     duration = min(actual_duration, MAX_DURATION_SEC)
@@ -119,7 +123,7 @@ def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
     vf = f"scale={new_w}:{new_h}:flags=lanczos,fps=30"
     logger.info("VIDEO FILTER: scale=%d:%d (source %dx%d)", new_w, new_h, w, h)
 
-    # --- Pass 1: CRF (quality-based) ---
+    # --- Pass 1: CRF ---
     cmd1 = [
         "ffmpeg", "-y", "-i", input_path,
         "-t", str(duration),
@@ -178,7 +182,6 @@ def convert_to_webm(input_path: str, output_path: str) -> tuple[bool, bool]:
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
-    # Resolve the media object (video, animation, or video/gif document)
     video = (
         message.video
         or message.animation
@@ -197,7 +200,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not video:
         return
 
-    # Guard against excessively large files before downloading
     file_size = getattr(video, "file_size", None)
     if file_size and file_size > MAX_INPUT_SIZE_BYTES:
         await message.reply_text(
@@ -268,43 +270,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ======================= APP FACTORY =======================
-def create_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+async def setup_webhook(application: Application):
+    """Register the webhook URL with Telegram."""
+    webhook_endpoint = f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}"
+    await application.bot.set_webhook(url=webhook_endpoint)
+    logger.info("Webhook set to: %s", webhook_endpoint)
 
-    # FIX: added filters.Document.IMAGE so image/gif documents are handled
-    app.add_handler(MessageHandler(
+
+def create_bot_app() -> Application:
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(MessageHandler(
         filters.VIDEO
         | filters.ANIMATION
         | filters.Document.VIDEO
         | filters.Document.IMAGE,
         handle_video
     ))
-    app.add_handler(MessageHandler(
+    application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         handle_text
     ))
-    return app
-
-
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    return application
 
 
 # ======================= ENTRY POINT =======================
 if __name__ == "__main__":
-    bot_app = create_app()
+    import uvicorn
+    from asgiref.wsgi import WsgiToAsgi
 
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    bot_app = create_bot_app()
 
-    # Graceful shutdown on SIGINT / SIGTERM
-    def _shutdown(signum, frame):
-        logger.info("Received signal %d, shutting down...", signum)
-        bot_app.stop_running()
+    asyncio.run(bot_app.initialize())
+    asyncio.run(setup_webhook(bot_app))
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    logger.info("🤖 Bot started (webhook mode) on %s", WEBHOOK_URL)
 
-    logger.info("🤖 Bot started (polling + Flask on port %s)", os.environ.get("PORT", 5000))
-    bot_app.run_polling()
+    port = int(os.environ.get("PORT", 5000))
+    asgi_app = WsgiToAsgi(flask_app)
+    uvicorn.run(asgi_app, host="0.0.0.0", port=port)
